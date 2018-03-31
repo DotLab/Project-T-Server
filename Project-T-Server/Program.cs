@@ -1,5 +1,9 @@
 ﻿using System;
 
+using System.Text;
+
+using System.IO;
+
 using System.Threading;
 
 using System.Collections.Generic;
@@ -44,11 +48,40 @@ namespace ProjectTServer {
 
 			socket.Connect(remoteEndPoint);
 
-			var lengthBuffer = new byte[LengthFieldSize];
-			var payloadBuffer = new byte[PayloadFieldMaxSize];
-			var hmacBuffer = new byte[HmacFieldSize];
+			var hmacServerKey = ExchangeKey(socket);
+			var hmacClientKey = ExchangeKey(socket);
 
-			ExchangeKey(socket, lengthBuffer, payloadBuffer, hmacBuffer);
+			var aesServerKey = ExchangeKey(socket);
+			var aesClientKey = ExchangeKey(socket);
+
+			var iv = ExchangeKey(socket);
+			var aesServerIv = new byte[16];
+			var aesClientIv = new byte[16];
+			Array.Copy(iv, 0, aesServerIv, 0, 16);
+			Array.Copy(iv, 16, aesClientIv, 0, 16);
+
+			var message = Encoding.UTF8.GetBytes("Hi from server.");
+			var cipherText = Encrypt(aesServerKey, aesServerIv, message, 0, message.Length);
+			Send(socket, hmacServerKey, cipherText, 0, cipherText.Length);
+
+			var buffer = new byte[PayloadFieldMaxSize];
+			int length = Receive(socket, hmacClientKey, buffer, 0);
+			message = Decrypt(aesClientKey, aesClientIv, buffer, 0, length);
+			Console.WriteLine(Encoding.UTF8.GetString(message));
+
+			using (var rng = new RNGCryptoServiceProvider()) {
+				message = new byte[4];
+				rng.GetBytes(message);
+				int answer = BitConverter.ToInt32(message, 0) + 1;
+
+				cipherText = Encrypt(aesServerKey, aesServerIv, message, 0, message.Length);
+				Send(socket, hmacServerKey, cipherText, 0, cipherText.Length);
+
+				length = Receive(socket, hmacClientKey, buffer, 0);
+				message = Decrypt(aesClientKey, aesClientIv, buffer, 0, length);
+
+				if (BitConverter.ToInt32(message, 0) == answer) Console.WriteLine("Verified!");
+			}
 
 			socket.Shutdown(SocketShutdown.Both);
 			socket.Close();
@@ -68,20 +101,39 @@ namespace ProjectTServer {
 		}
 			
 		const int LengthFieldSize = 4, PayloadFieldMaxSize = 1024, HmacFieldSize = 32;
-		static void ClientHandler(Socket client) {
-			/* field   size   type
-			 * length  4      uint
-			 * payload length bits
-			 * hmac    32     sha256
-			 */
-			var lengthBuffer = new byte[LengthFieldSize];
-			var payloadBuffer = new byte[PayloadFieldMaxSize];
-			var hmacBuffer = new byte[HmacFieldSize];
+		static void ClientHandler(Socket socket) {
+			var hmacServerKey = ExchangeKey(socket);
+			var hmacClientKey = ExchangeKey(socket);
 
-			ExchangeKey(client, lengthBuffer, payloadBuffer, hmacBuffer);
+			var aesServerKey = ExchangeKey(socket);
+			var aesClientKey = ExchangeKey(socket);
 
-			client.Shutdown(SocketShutdown.Both);
-			client.Close();
+			var iv = ExchangeKey(socket);
+			var aesServerIv = new byte[16];
+			var aesClientIv = new byte[16];
+			Array.Copy(iv, 0, aesServerIv, 0, 16);
+			Array.Copy(iv, 16, aesClientIv, 0, 16);
+
+			var buffer = new byte[PayloadFieldMaxSize];
+			int length = Receive(socket, hmacServerKey, buffer, 0);
+			var message = Decrypt(aesServerKey, aesServerIv, buffer, 0, length);
+			Console.WriteLine(Encoding.UTF8.GetString(message));
+
+			message = Encoding.UTF8.GetBytes("Hi from client.");
+			var cipherText = Encrypt(aesClientKey, aesClientIv, message, 0, message.Length);
+			Send(socket, hmacClientKey, cipherText, 0, cipherText.Length);
+
+			length = Receive(socket, hmacServerKey, buffer, 0);
+			message = Decrypt(aesServerKey, aesServerIv, buffer, 0, length);
+
+			message = BitConverter.GetBytes((Int32)(BitConverter.ToInt32(message, 0) + 1));
+			cipherText = Encrypt(aesClientKey, aesClientIv, message, 0, message.Length);
+			Send(socket, hmacClientKey, cipherText, 0, cipherText.Length);
+
+			Console.WriteLine("Finish challenge");
+
+			socket.Shutdown(SocketShutdown.Both);
+			socket.Close();
 		}
 
 #region HamcKey
@@ -155,7 +207,12 @@ namespace ProjectTServer {
 
 #endregion
 
-		static int Send(Socket socket, byte[] payload, int offset, int length) {
+		/* field   size   type
+		 * length  4      uint
+		 * payload length bits
+		 * hmac    32     sha256
+		 */
+		static int Send(Socket socket, byte[] key, byte[] payload, int offset, int length) {
 			Console.WriteLine("\tsend...");
 			Console.WriteLine("\t\tlength: {0}", length);
 
@@ -179,7 +236,7 @@ namespace ProjectTServer {
 				return -1;
 			}
 
-			using (var hasher = new HMACSHA256(HmacKey)) {
+			using (var hasher = new HMACSHA256(key)) {
 				var hash = hasher.ComputeHash(payload, offset, length);
 				Console.WriteLine("\t\thash: {0}", BytesToString(hash));
 				
@@ -197,10 +254,11 @@ namespace ProjectTServer {
 			return length;
 		}
 
-		static int Receive(Socket socket, byte[] lengthBuffer, byte[] payloadBuffer, byte[] hmacBuffer) {
+		static int Receive(Socket socket, byte[] key, byte[] payload, int offset) {
 			Console.WriteLine("\treceive...");
 
 			SocketError error;
+			var lengthBuffer = new byte[LengthFieldSize];
 			int received = socket.Receive(lengthBuffer, 0, LengthFieldSize, SocketFlags.None, out error);
 			if (error != SocketError.Success) {
 				Console.WriteLine("\t\terror: {0}", error);
@@ -217,7 +275,7 @@ namespace ProjectTServer {
 				return -1;
 			}
 
-			received = socket.Receive(payloadBuffer, 0, length, SocketFlags.None, out error);
+			received = socket.Receive(payload, offset, length, SocketFlags.None, out error);
 			if (error != SocketError.Success) {
 				Console.WriteLine("\t\terror: {0}", error);
 				return -1;
@@ -226,6 +284,7 @@ namespace ProjectTServer {
 				return -1;
 			}
 
+			var hmacBuffer = new byte[HmacFieldSize];
 			received = socket.Receive(hmacBuffer, 0, HmacFieldSize, SocketFlags.None, out error);
 			if (error != SocketError.Success) {
 				Console.WriteLine("\t\terror: {0}", error);
@@ -236,8 +295,8 @@ namespace ProjectTServer {
 			}
 			Console.WriteLine("\t\thmac: {0}", BytesToString(hmacBuffer));
 
-			using (var hasher = new HMACSHA256(HmacKey)) {
-				var hash = hasher.ComputeHash(payloadBuffer, 0, length);
+			using (var hasher = new HMACSHA256(key)) {
+				var hash = hasher.ComputeHash(payload, 0, length);
 				Console.WriteLine("\t\thash: {0}", BytesToString(hash));
 
 				bool isEqual = true;
@@ -257,7 +316,7 @@ namespace ProjectTServer {
 			return length;
 		}
 
-		static byte[] ExchangeKey(Socket socket, byte[] lengthBuffer, byte[] payloadBuffer, byte[] hmacBuffer) {
+		static byte[] ExchangeKey(Socket socket) {
 			Console.WriteLine("exchange key...");
 
 			using (var dh = new ECDiffieHellmanCng()) {
@@ -266,10 +325,10 @@ namespace ProjectTServer {
 
 				var publicKey = dh.PublicKey.ToByteArray();
 				Console.WriteLine("\tpublic key: {0}", BytesToString(publicKey));
-				Send(socket, publicKey, 0, publicKey.Length);
+				Send(socket, HmacKey, publicKey, 0, publicKey.Length);
 
 				var otherKey = new byte[publicKey.Length];
-				Receive(socket, lengthBuffer, otherKey, hmacBuffer);
+				Receive(socket, HmacKey, otherKey, 0);
 				Console.WriteLine("\tother key: {0}", BytesToString(otherKey));
 
 				var key = dh.DeriveKeyMaterial(CngKey.Import(otherKey, CngKeyBlobFormat.EccPublicBlob));
@@ -279,8 +338,38 @@ namespace ProjectTServer {
 			}
 		}
 
+		static byte[] Encrypt(byte[] key, byte[] iv, byte[] message, int offset, int length) {
+			using (var aes = new AesCryptoServiceProvider()) {
+				aes.Key = key;
+				aes.IV = iv;
+
+				using (var cipherText = new MemoryStream()) using (var cryptoStream = new CryptoStream(cipherText, aes.CreateEncryptor(), CryptoStreamMode.Write)) {
+
+					cryptoStream.Write(message, offset, length);
+					cryptoStream.Close();
+
+					return cipherText.ToArray();
+				}
+			}
+		}
+
+		static byte[] Decrypt(byte[] key, byte[] iv, byte[] cipherText, int offset, int length) {
+			using (var aes = new AesCryptoServiceProvider()) {
+				aes.Key = key;
+				aes.IV = iv;
+
+				using (var message = new MemoryStream()) using (var cryptoStream = new CryptoStream(message, aes.CreateDecryptor(), CryptoStreamMode.Write)) {
+
+					cryptoStream.Write(cipherText, offset, length);
+					cryptoStream.Close();
+
+					return message.ToArray();
+				}
+			}
+		}
+
 		static string BytesToString(byte[] bytes) {
-			const int previewLength = 32;
+			const int previewLength = 16;
 			return bytes.Length < previewLength ? string.Format("{0} ({1})", BitConverter.ToString(bytes), bytes.Length) : string.Format("{0}... ({1})", BitConverter.ToString(bytes, 0, previewLength), bytes.Length);
 		}
 	}
